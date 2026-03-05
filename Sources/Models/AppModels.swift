@@ -71,37 +71,103 @@ struct ProcessEntry: Identifiable, Equatable, Sendable {
 
 struct MacSystemSnapshot: Equatable, Sendable {
     let uptime: String
-    let loadAverage: String
+    let loadAverageOneMinute: String
+    let loadAverageFiveMinutes: String
+    let loadAverageFifteenMinutes: String
     let memoryUsed: String
     let memoryTotal: String
+    let memoryUsedBytes: Int64
+    let memoryTotalBytes: Int64
     let diskFree: String
     let diskTotal: String
+    let diskFreeBytes: Int64
+    let diskTotalBytes: Int64
+    let swapUsed: String
+    let swapTotal: String
+    let swapUsedBytes: Int64
+    let swapTotalBytes: Int64
+    let batteryLevelPercent: Int?
+    let batteryState: String?
+    let processCount: Int
     let topProcesses: [ProcessEntry]
+    let topMemoryProcesses: [ProcessEntry]
 
     static let empty = MacSystemSnapshot(
         uptime: "-",
-        loadAverage: "-",
+        loadAverageOneMinute: "-",
+        loadAverageFiveMinutes: "-",
+        loadAverageFifteenMinutes: "-",
         memoryUsed: "-",
         memoryTotal: "-",
+        memoryUsedBytes: 0,
+        memoryTotalBytes: 0,
         diskFree: "-",
         diskTotal: "-",
-        topProcesses: []
+        diskFreeBytes: 0,
+        diskTotalBytes: 0,
+        swapUsed: "-",
+        swapTotal: "-",
+        swapUsedBytes: 0,
+        swapTotalBytes: 0,
+        batteryLevelPercent: nil,
+        batteryState: nil,
+        processCount: 0,
+        topProcesses: [],
+        topMemoryProcesses: []
     )
 
+    var loadAverage: String {
+        "\(loadAverageOneMinute) \(loadAverageFiveMinutes) \(loadAverageFifteenMinutes)"
+    }
+
+    var memoryUsageFraction: Double {
+        guard memoryTotalBytes > 0 else { return 0 }
+        return min(1, max(0, Double(memoryUsedBytes) / Double(memoryTotalBytes)))
+    }
+
+    var diskUsageFraction: Double {
+        guard diskTotalBytes > 0 else { return 0 }
+        let usedBytes = max(0, diskTotalBytes - diskFreeBytes)
+        return min(1, max(0, Double(usedBytes) / Double(diskTotalBytes)))
+    }
+
+    var swapUsageFraction: Double {
+        guard swapTotalBytes > 0 else { return 0 }
+        return min(1, max(0, Double(swapUsedBytes) / Double(swapTotalBytes)))
+    }
+
+    var batterySummary: String {
+        guard let batteryLevelPercent else {
+            return "Unavailable"
+        }
+        let state = batteryState ?? "Unknown"
+        return "\(batteryLevelPercent)% · \(state)"
+    }
+
     var promptSummary: String {
-        let processSummary = topProcesses
+        let hotProcessesSummary = topProcesses
             .prefix(5)
             .map { "PID \($0.pid) CPU \($0.cpuPercent)% MEM \($0.memoryPercent)% \($0.command)" }
+            .joined(separator: "\n")
+
+        let memoryProcessesSummary = topMemoryProcesses
+            .prefix(5)
+            .map { "PID \($0.pid) MEM \($0.memoryPercent)% CPU \($0.cpuPercent)% \($0.command)" }
             .joined(separator: "\n")
 
         return """
         Mac status snapshot:
         - Uptime: \(uptime)
-        - Load average: \(loadAverage)
+        - Load average (1/5/15m): \(loadAverage)
         - Memory: \(memoryUsed) / \(memoryTotal)
+        - Swap: \(swapUsed) / \(swapTotal)
         - Disk free: \(diskFree) / \(diskTotal)
-        - Top processes:
-        \(processSummary.isEmpty ? "(no data)" : processSummary)
+        - Battery: \(batterySummary)
+        - Process count: \(processCount)
+        - Top CPU processes:
+        \(hotProcessesSummary.isEmpty ? "(no data)" : hotProcessesSummary)
+        - Top memory processes:
+        \(memoryProcessesSummary.isEmpty ? "(no data)" : memoryProcessesSummary)
         """
     }
 }

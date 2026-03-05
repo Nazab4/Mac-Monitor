@@ -6,7 +6,7 @@ let project = Project(
     settings: .settings(
         base: [
             "SWIFT_VERSION": "5.10",
-            "MACOSX_DEPLOYMENT_TARGET": "14.0"
+            "MACOSX_DEPLOYMENT_TARGET": "26.0"
         ]
     ),
     targets: [
@@ -15,7 +15,7 @@ let project = Project(
             destinations: .macOS,
             product: .app,
             bundleId: "com.dimillian.MacMonitor",
-            deploymentTargets: .macOS("14.0"),
+            deploymentTargets: .macOS("26.0"),
             infoPlist: .extendingDefault(with: [
                 "CFBundleDisplayName": .string("MacMonitor"),
                 "LSUIElement": .boolean(true)

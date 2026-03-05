@@ -46,7 +46,10 @@ struct MenuBarConversationView: View {
             } else {
                 SystemStatusView(
                     conversationStore: conversationStore,
-                    systemStore: systemStore
+                    systemStore: systemStore,
+                    onSendToAgent: {
+                        selectedTab = .agent
+                    }
                 )
             }
 

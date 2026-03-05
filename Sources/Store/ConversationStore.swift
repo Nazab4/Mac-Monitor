@@ -71,6 +71,10 @@ final class ConversationStore {
         !pendingApprovals.isEmpty
     }
 
+    var canSendQuickAction: Bool {
+        !isTurnInProgress && !isSending
+    }
+
     var instructionsSourceSummary: String {
         if bundledAgentsInstructions != nil {
             if let bundledAgentsFilePath {
@@ -132,6 +136,23 @@ final class ConversationStore {
 
     func sendSystemSnapshot(_ snapshot: MacSystemSnapshot) async {
         await send(text: snapshot.promptSummary)
+    }
+
+    func sendQuickQuestion(_ question: String, snapshot: MacSystemSnapshot? = nil) async {
+        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard canSendQuickAction else {
+            appendSystemMessage("Wait for the current turn to finish before sending another quick action.")
+            return
+        }
+
+        var payload = trimmed
+        if let snapshot {
+            payload += "\n\nUse this live context:\n\(snapshot.promptSummary)"
+        }
+
+        await send(text: payload)
     }
 
     func respondToApproval(_ approval: PendingApproval, accept: Bool) async {
