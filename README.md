@@ -7,6 +7,19 @@ It provides:
 - Approval controls for command/file-change requests.
 - Local machine telemetry (uptime, load average, memory, disk, and top processes).
 
+## Screenshots
+
+<table>
+  <tr>
+    <th>Agent Tab</th>
+    <th>System Tab</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/agent-tab.png" alt="MacMonitor Agent Tab" width="420" /></td>
+    <td><img src="docs/screenshots/system-tab.png" alt="MacMonitor System Tab" width="420" /></td>
+  </tr>
+</table>
+
 ## Architecture
 
 - `Sources/Client/CodexAppServerSession.swift`: JSON-RPC transport/session actor for `codex app-server`.
