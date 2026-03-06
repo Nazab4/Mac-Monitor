@@ -36,12 +36,7 @@ final class ConversationStore {
     private var sessionID: UUID?
     private var sessionsByID: [UUID: CodexAppServerSession] = [:]
 
-    var messages: [ChatMessage] = [
-        ChatMessage(
-            role: .system,
-            text: "MacMonitor is ready. Ask for diagnostics, process checks, or admin guidance."
-        )
-    ]
+    var messages: [ChatMessage]
     var pendingApprovals: [PendingApproval] = []
 
     var threadID: String?
@@ -57,6 +52,7 @@ final class ConversationStore {
         self.workingDirectory = resolvedWorkingDirectory
         self.bundledAgentsFilePath = bundledAgents.path
         self.bundledAgentsInstructions = bundledAgents.content
+        self.messages = Self.makeInitialMessages()
 
         UserDefaults.standard.set(self.workingDirectory, forKey: workingDirectoryDefaultsKey)
     }
@@ -130,7 +126,7 @@ final class ConversationStore {
                 developerInstructions: developerInstructions
             )
             applyThreadID(threadID)
-            resetLiveTurnState()
+            resetConversationTranscript()
             appendSystemMessage("Started new MacMonitor thread.")
         } catch {
             handleError("Failed to start new thread: \(error.localizedDescription)")
@@ -519,6 +515,12 @@ final class ConversationStore {
         clearThinkingPlaceholder()
     }
 
+    private func resetConversationTranscript() {
+        resetLiveTurnState()
+        messages = Self.makeInitialMessages()
+        lastErrorMessage = nil
+    }
+
     private func handleError(_ message: String) {
         connectionStatus = .failed
         lastErrorMessage = message
@@ -548,6 +550,15 @@ final class ConversationStore {
 
         messages.removeAll(where: { $0.id == pendingThinkingMessageID })
         self.pendingThinkingMessageID = nil
+    }
+
+    private static func makeInitialMessages() -> [ChatMessage] {
+        [
+            ChatMessage(
+                role: .system,
+                text: "MacMonitor is ready. Ask for diagnostics, process checks, or admin guidance."
+            )
+        ]
     }
 
     private static func resolveWorkingDirectory(preferred: String?) -> String {
