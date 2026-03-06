@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum AppServerEvent: Sendable {
@@ -8,10 +9,22 @@ enum AppServerEvent: Sendable {
     case turnCompleted(threadID: String, turnID: String, status: String, errorMessage: String?)
     case agentMessageDelta(threadID: String, itemID: String, delta: String)
     case agentMessageCompleted(threadID: String, itemID: String, text: String)
-    case commandApprovalRequest(requestID: Int, itemID: String, command: String?, cwd: String?, reason: String?)
-    case fileChangeApprovalRequest(requestID: Int, itemID: String, reason: String?)
-    case toolUserInputRequest(requestID: Int, questionIDs: [String])
-    case turnError(String)
+    case commandApprovalRequest(
+        threadID: String,
+        requestID: Int,
+        itemID: String,
+        command: String?,
+        cwd: String?,
+        reason: String?
+    )
+    case fileChangeApprovalRequest(
+        threadID: String,
+        requestID: Int,
+        itemID: String,
+        reason: String?
+    )
+    case toolUserInputRequest(threadID: String, requestID: Int, questionIDs: [String])
+    case turnError(threadID: String?, message: String)
 }
 
 actor CodexAppServerSession {
@@ -52,6 +65,8 @@ actor CodexAppServerSession {
     private var pendingResponses: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var nextRequestID = 1
     private var isStarted = false
+    private var isStopping = false
+    private var didEmitDisconnectedEvent = false
     private var lastStderrText = ""
 
     private let onEvent: @Sendable (AppServerEvent) -> Void
@@ -69,6 +84,10 @@ actor CodexAppServerSession {
         guard !isStarted else {
             return
         }
+
+        isStopping = false
+        didEmitDisconnectedEvent = false
+        lastStderrText = ""
 
         var env = ProcessInfo.processInfo.environment
         if env["PATH"] == nil {
@@ -92,22 +111,22 @@ actor CodexAppServerSession {
         startReaderLoop()
 
         do {
-            let _ = try await sendRequest(
+            _ = try await sendRequest(
                 method: "initialize",
                 params: [
                     "clientInfo": [
                         "name": "mac-monitor",
                         "title": "MacMonitor",
-                        "version": "0.1.0"
+                        "version": "0.1.0",
                     ],
                     "capabilities": [
-                        "experimentalApi": false
-                    ]
+                        "experimentalApi": false,
+                    ],
                 ]
             )
             try sendNotification(method: "initialized", params: [:])
         } catch {
-            stop()
+            await stop()
             throw error
         }
 
@@ -119,7 +138,7 @@ actor CodexAppServerSession {
         var params: [String: Any] = [
             "cwd": cwd,
             "serviceName": "mac-monitor",
-            "personality": "pragmatic"
+            "personality": "pragmatic",
         ]
 
         if let developerInstructions, !developerInstructions.isEmpty {
@@ -146,9 +165,9 @@ actor CodexAppServerSession {
                     [
                         "type": "text",
                         "text": text,
-                        "textElements": [] as [String]
-                    ]
-                ]
+                        "textElements": [] as [String],
+                    ],
+                ],
             ]
         )
     }
@@ -175,26 +194,27 @@ actor CodexAppServerSession {
         try sendResponse(id: requestID, result: ["answers": answers])
     }
 
-    func stop() {
-        guard process.isRunning else {
-            resolveAllPendingResponses(with: AppServerSessionError.closed)
-            return
-        }
+    func stop() async {
+        isStopping = true
+        readerTask?.cancel()
+        readerTask = nil
 
-        process.terminate()
-        process.waitUntilExit()
+        if process.isRunning {
+            process.terminate()
+            var didExit = await waitUntilExit(process, timeoutNanoseconds: 2_000_000_000)
+            if !didExit, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                didExit = await waitUntilExit(process, timeoutNanoseconds: 1_000_000_000)
+            }
+            _ = didExit
+        }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         stdoutLineContinuation.finish()
 
         resolveAllPendingResponses(with: AppServerSessionError.closed)
-        if !lastStderrText.isEmpty {
-            onEvent(.disconnected(lastStderrText))
-        } else {
-            onEvent(.disconnected("Codex app-server stopped."))
-        }
-
+        emitDisconnected(message: !lastStderrText.isEmpty ? lastStderrText : "Codex app-server stopped.")
         isStarted = false
     }
 
@@ -288,31 +308,56 @@ actor CodexAppServerSession {
     private func handleServerRequest(id requestID: Int, method: String, params: [String: Any]) {
         switch method {
         case "item/commandExecution/requestApproval":
-            let itemID = params["itemId"] as? String ?? "unknown"
+            guard let threadID = resolveThreadID(params: params) else {
+                return
+            }
+            let itemID = Self.nonEmptyString(params["itemId"] ?? params["item_id"]) ?? "unknown"
             let command = params["command"] as? String
             let cwd = params["cwd"] as? String
             let reason = params["reason"] as? String
-            onEvent(.commandApprovalRequest(requestID: requestID, itemID: itemID, command: command, cwd: cwd, reason: reason))
+            onEvent(
+                .commandApprovalRequest(
+                    threadID: threadID,
+                    requestID: requestID,
+                    itemID: itemID,
+                    command: command,
+                    cwd: cwd,
+                    reason: reason
+                )
+            )
 
         case "item/fileChange/requestApproval":
-            let itemID = params["itemId"] as? String ?? "unknown"
+            guard let threadID = resolveThreadID(params: params) else {
+                return
+            }
+            let itemID = Self.nonEmptyString(params["itemId"] ?? params["item_id"]) ?? "unknown"
             let reason = params["reason"] as? String
-            onEvent(.fileChangeApprovalRequest(requestID: requestID, itemID: itemID, reason: reason))
+            onEvent(
+                .fileChangeApprovalRequest(
+                    threadID: threadID,
+                    requestID: requestID,
+                    itemID: itemID,
+                    reason: reason
+                )
+            )
 
         case "item/tool/requestUserInput":
+            guard let threadID = resolveThreadID(params: params) else {
+                return
+            }
             let questionIDs: [String]
             if let questions = params["questions"] as? [[String: Any]] {
-                questionIDs = questions.compactMap { $0["id"] as? String }
+                questionIDs = questions.compactMap { Self.nonEmptyString($0["id"]) }
             } else {
                 questionIDs = []
             }
-            onEvent(.toolUserInputRequest(requestID: requestID, questionIDs: questionIDs))
+            onEvent(.toolUserInputRequest(threadID: threadID, requestID: requestID, questionIDs: questionIDs))
 
         default:
             do {
                 try sendResponse(id: requestID, result: [:])
             } catch {
-                onEvent(.turnError("Failed to answer server request \(method): \(error.localizedDescription)"))
+                onEvent(.turnError(threadID: nil, message: "Failed to answer server request \(method): \(error.localizedDescription)"))
             }
         }
     }
@@ -321,7 +366,7 @@ actor CodexAppServerSession {
         switch method {
         case "thread/started":
             guard let thread = params["thread"] as? [String: Any],
-                  let threadID = thread["id"] as? String
+                  let threadID = Self.nonEmptyString(thread["id"])
             else {
                 return
             }
@@ -329,7 +374,7 @@ actor CodexAppServerSession {
 
         case "turn/started":
             guard let turn = params["turn"] as? [String: Any],
-                  let turnID = turn["id"] as? String
+                  let turnID = Self.nonEmptyString(turn["id"])
             else {
                 return
             }
@@ -340,7 +385,7 @@ actor CodexAppServerSession {
 
         case "turn/completed":
             guard let turn = params["turn"] as? [String: Any],
-                  let turnID = turn["id"] as? String
+                  let turnID = Self.nonEmptyString(turn["id"])
             else {
                 return
             }
@@ -359,8 +404,8 @@ actor CodexAppServerSession {
             onEvent(.turnCompleted(threadID: threadID, turnID: turnID, status: status, errorMessage: errorMessage))
 
         case "item/agentMessage/delta":
-            guard let itemID = Self.stringValue(params["itemId"] ?? params["item_id"]),
-                  let delta = Self.stringValue(params["delta"]),
+            guard let itemID = Self.nonEmptyString(params["itemId"] ?? params["item_id"]),
+                  let delta = Self.rawString(params["delta"]),
                   let threadID = resolveThreadID(params: params)
             else {
                 return
@@ -371,8 +416,8 @@ actor CodexAppServerSession {
             guard let item = params["item"] as? [String: Any],
                   let type = item["type"] as? String,
                   type == "agentMessage",
-                  let itemID = Self.stringValue(item["id"]),
-                  let text = Self.stringValue(item["text"]),
+                  let itemID = Self.nonEmptyString(item["id"]),
+                  let text = Self.rawString(item["text"]),
                   let threadID = resolveThreadID(params: params, item: item)
             else {
                 return
@@ -381,12 +426,12 @@ actor CodexAppServerSession {
 
         case "error":
             if let errorObject = params["error"] as? [String: Any],
-               let message = errorObject["message"] as? String {
-                onEvent(.turnError(message))
+               let message = Self.rawString(errorObject["message"]) {
+                onEvent(.turnError(threadID: resolveThreadID(params: params), message: message))
             }
 
         case "thread/closed":
-            onEvent(.disconnected("Thread closed by app-server."))
+            emitDisconnected(message: "Thread closed by app-server.")
 
         default:
             break
@@ -395,10 +440,12 @@ actor CodexAppServerSession {
 
     private func handleReaderLoopEnded() {
         resolveAllPendingResponses(with: AppServerSessionError.closed)
-        if !lastStderrText.isEmpty {
-            onEvent(.disconnected(lastStderrText))
-        } else {
-            onEvent(.disconnected("Lost connection to codex app-server."))
+        if !isStopping {
+            emitDisconnected(
+                message: !lastStderrText.isEmpty
+                    ? lastStderrText
+                    : "Lost connection to codex app-server."
+            )
         }
         isStarted = false
     }
@@ -448,8 +495,7 @@ actor CodexAppServerSession {
     private func extractThreadID(from response: [String: Any]) throws -> String {
         guard let result = response["result"] as? [String: Any],
               let thread = result["thread"] as? [String: Any],
-              let threadID = thread["id"] as? String,
-              !threadID.isEmpty
+              let threadID = Self.nonEmptyString(thread["id"])
         else {
             throw AppServerSessionError.malformedResponse("Missing thread id in thread/start response")
         }
@@ -462,22 +508,22 @@ actor CodexAppServerSession {
         turn: [String: Any]? = nil,
         item: [String: Any]? = nil
     ) -> String? {
-        if let threadID = Self.stringValue(params["threadId"] ?? params["thread_id"]) {
+        if let threadID = Self.nonEmptyString(params["threadId"] ?? params["thread_id"]) {
             return threadID
         }
 
-        if let turn, let threadID = Self.stringValue(turn["threadId"] ?? turn["thread_id"]) {
+        if let turn, let threadID = Self.nonEmptyString(turn["threadId"] ?? turn["thread_id"]) {
             return threadID
         }
 
-        if let item, let threadID = Self.stringValue(item["threadId"] ?? item["thread_id"]) {
+        if let item, let threadID = Self.nonEmptyString(item["threadId"] ?? item["thread_id"]) {
             return threadID
         }
 
         return nil
     }
 
-    private static func stringValue(_ value: Any?) -> String? {
+    private static func nonEmptyString(_ value: Any?) -> String? {
         guard let string = value as? String else {
             return nil
         }
@@ -486,6 +532,44 @@ actor CodexAppServerSession {
             return nil
         }
         return trimmed
+    }
+
+    private static func rawString(_ value: Any?) -> String? {
+        value as? String
+    }
+
+    private func emitDisconnected(message: String) {
+        guard !didEmitDisconnectedEvent else {
+            return
+        }
+        didEmitDisconnectedEvent = true
+        onEvent(.disconnected(message))
+    }
+
+    private func waitUntilExit(_ process: Process, timeoutNanoseconds: UInt64) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global(qos: .utility).async {
+                        process.waitUntilExit()
+                        continuation.resume(returning: ())
+                    }
+                }
+                return true
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                } catch {
+                    return false
+                }
+                return false
+            }
+
+            let didExit = await group.next() ?? false
+            group.cancelAll()
+            return didExit
+        }
     }
 
     private static func jsonInt(_ value: Any?) -> Int? {

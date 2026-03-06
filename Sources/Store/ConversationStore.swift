@@ -33,6 +33,8 @@ final class ConversationStore {
     private var pendingThinkingMessageID: String?
 
     private var session: CodexAppServerSession?
+    private var sessionID: UUID?
+    private var sessionsByID: [UUID: CodexAppServerSession] = [:]
 
     var messages: [ChatMessage] = [
         ChatMessage(
@@ -93,24 +95,34 @@ final class ConversationStore {
     }
 
     func reconnect() async {
-        stopSession()
+        guard canChangeThreadContext(for: "reconnecting") else {
+            return
+        }
+        await stopSession()
         await connect()
     }
 
-    func stopSession() {
+    func stopSession() async {
         guard let session else {
             return
         }
 
-        Task {
-            await session.stop()
-        }
+        let stoppedSessionID = sessionID
         self.session = nil
+        self.sessionID = nil
+        resetLiveTurnState()
         connectionStatus = .disconnected
+        await session.stop()
+        if let stoppedSessionID {
+            sessionsByID.removeValue(forKey: stoppedSessionID)
+        }
     }
 
     func startNewThread() async {
         guard let session else { return }
+        guard canChangeThreadContext(for: "starting a new thread") else {
+            return
+        }
 
         do {
             let threadID = try await session.startThread(
@@ -118,9 +130,7 @@ final class ConversationStore {
                 developerInstructions: developerInstructions
             )
             applyThreadID(threadID)
-            activeTurnID = nil
-            pendingApprovals.removeAll()
-            streamingMessageIDByItemID.removeAll()
+            resetLiveTurnState()
             appendSystemMessage("Started new MacMonitor thread.")
         } catch {
             handleError("Failed to start new thread: \(error.localizedDescription)")
@@ -182,13 +192,16 @@ final class ConversationStore {
         connectionStatus = .connecting
         lastErrorMessage = nil
 
+        let sessionID = UUID()
         let session = CodexAppServerSession { [weak self] event in
             Task { @MainActor [weak self] in
-                self?.handleAppServerEvent(event)
+                self?.handleAppServerEvent(event, from: sessionID)
             }
         }
 
         self.session = session
+        self.sessionID = sessionID
+        self.sessionsByID[sessionID] = session
 
         do {
             try await session.start()
@@ -204,6 +217,11 @@ final class ConversationStore {
             }
             try await ensureThread(on: session)
         } catch {
+            if self.sessionID == sessionID {
+                self.session = nil
+                self.sessionID = nil
+            }
+            self.sessionsByID.removeValue(forKey: sessionID)
             handleError(error.localizedDescription)
         }
     }
@@ -255,32 +273,42 @@ final class ConversationStore {
         }
     }
 
-    private func handleAppServerEvent(_ event: AppServerEvent) {
+    private func handleAppServerEvent(_ event: AppServerEvent, from sessionID: UUID) {
         switch event {
         case .connected:
+            guard isActiveSession(sessionID) else {
+                return
+            }
             connectionStatus = .connected
 
         case .disconnected(let message):
+            guard isActiveSession(sessionID) else {
+                return
+            }
             connectionStatus = .disconnected
+            resetLiveTurnState()
             if !message.isEmpty {
                 appendSystemMessage(message)
             }
 
         case .threadStarted(let startedThreadID):
+            guard isActiveSession(sessionID) else {
+                return
+            }
             if let activeThreadID = threadID, activeThreadID != startedThreadID {
                 return
             }
             applyThreadID(startedThreadID)
 
         case .turnStarted(let threadID, let turnID):
-            guard shouldHandleEvent(for: threadID) else {
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
                 return
             }
             activeTurnID = turnID
             isTurnInProgress = true
 
         case .turnCompleted(let threadID, let turnID, let status, let errorMessage):
-            guard shouldHandleEvent(for: threadID) else {
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
                 return
             }
             if activeTurnID == turnID {
@@ -296,18 +324,22 @@ final class ConversationStore {
             }
 
         case .agentMessageDelta(let threadID, let itemID, let delta):
-            guard shouldHandleEvent(for: threadID) else {
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
                 return
             }
             appendAssistantDelta(itemID: itemID, delta: delta)
 
         case .agentMessageCompleted(let threadID, let itemID, let text):
-            guard shouldHandleEvent(for: threadID) else {
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
                 return
             }
             finalizeAssistantMessage(itemID: itemID, text: text)
 
-        case .commandApprovalRequest(let requestID, let itemID, let command, let cwd, let reason):
+        case .commandApprovalRequest(let threadID, let requestID, let itemID, let command, let cwd, let reason):
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
+                declineCommandApproval(requestID: requestID, for: sessionID)
+                return
+            }
             pendingApprovals.append(
                 PendingApproval(
                     requestID: requestID,
@@ -319,7 +351,11 @@ final class ConversationStore {
                 )
             )
 
-        case .fileChangeApprovalRequest(let requestID, let itemID, let reason):
+        case .fileChangeApprovalRequest(let threadID, let requestID, let itemID, let reason):
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
+                declineFileChangeApproval(requestID: requestID, for: sessionID)
+                return
+            }
             pendingApprovals.append(
                 PendingApproval(
                     requestID: requestID,
@@ -329,20 +365,25 @@ final class ConversationStore {
                 )
             )
 
-        case .toolUserInputRequest(let requestID, let questionIDs):
-            Task {
-                guard let session else { return }
-
-                do {
-                    let emptyAnswers = Dictionary(uniqueKeysWithValues: questionIDs.map { ($0, "") })
-                    try await session.respondToToolUserInput(requestID: requestID, answersByQuestionID: emptyAnswers)
-                    appendSystemMessage("Tool asked for user input; submitted blank answers (MVP behavior).")
-                } catch {
-                    handleError("Failed to answer tool user-input request: \(error.localizedDescription)")
-                }
+        case .toolUserInputRequest(let threadID, let requestID, let questionIDs):
+            guard shouldHandleEvent(for: threadID, from: sessionID) else {
+                respondToToolUserInput(
+                    requestID: requestID,
+                    questionIDs: questionIDs,
+                    for: sessionID,
+                    suppressErrors: true
+                )
+                return
             }
+            respondToToolUserInput(requestID: requestID, questionIDs: questionIDs, for: sessionID)
 
-        case .turnError(let message):
+        case .turnError(let threadID, let message):
+            guard isActiveSession(sessionID) else {
+                return
+            }
+            if let threadID, !shouldHandleEvent(for: threadID, from: sessionID) {
+                return
+            }
             handleError(message)
         }
     }
@@ -406,11 +447,76 @@ final class ConversationStore {
         UserDefaults.standard.set(threadID, forKey: threadIDDefaultsKey)
     }
 
-    private func shouldHandleEvent(for eventThreadID: String) -> Bool {
+    private func isActiveSession(_ sessionID: UUID) -> Bool {
+        self.sessionID == sessionID
+    }
+
+    private func shouldHandleEvent(for eventThreadID: String, from sessionID: UUID) -> Bool {
+        guard isActiveSession(sessionID) else {
+            return false
+        }
         guard let activeThreadID = threadID else {
             return false
         }
         return activeThreadID == eventThreadID
+    }
+
+    private func canChangeThreadContext(for action: String) -> Bool {
+        if case .connected = connectionStatus, isTurnInProgress {
+            appendSystemMessage("Wait for the current turn to finish before \(action).")
+            return false
+        }
+        return true
+    }
+
+    private func declineCommandApproval(requestID: Int, for sessionID: UUID) {
+        Task {
+            guard let session = self.session(for: sessionID) else { return }
+            try? await session.respondToCommandApproval(requestID: requestID, accept: false)
+        }
+    }
+
+    private func declineFileChangeApproval(requestID: Int, for sessionID: UUID) {
+        Task {
+            guard let session = self.session(for: sessionID) else { return }
+            try? await session.respondToFileChangeApproval(requestID: requestID, accept: false)
+        }
+    }
+
+    private func respondToToolUserInput(
+        requestID: Int,
+        questionIDs: [String],
+        for sessionID: UUID,
+        suppressErrors: Bool = false
+    ) {
+        Task {
+            guard let session = self.session(for: sessionID) else { return }
+            do {
+                let emptyAnswers = Dictionary(uniqueKeysWithValues: questionIDs.map { ($0, "") })
+                try await session.respondToToolUserInput(requestID: requestID, answersByQuestionID: emptyAnswers)
+                if !suppressErrors {
+                    appendSystemMessage("Tool asked for user input; submitted blank answers (MVP behavior).")
+                }
+            } catch {
+                guard !suppressErrors else {
+                    return
+                }
+                handleError("Failed to answer tool user-input request: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func session(for sessionID: UUID) -> CodexAppServerSession? {
+        sessionsByID[sessionID]
+    }
+
+    private func resetLiveTurnState() {
+        activeTurnID = nil
+        isSending = false
+        isTurnInProgress = false
+        pendingApprovals.removeAll()
+        streamingMessageIDByItemID.removeAll()
+        clearThinkingPlaceholder()
     }
 
     private func handleError(_ message: String) {
